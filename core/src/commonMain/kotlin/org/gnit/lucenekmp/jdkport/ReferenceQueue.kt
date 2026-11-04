@@ -5,13 +5,14 @@ package org.gnit.lucenekmp.jdkport
  * A simple mimic of Java's java.lang.ref.ReferenceQueue.
  *
  * This implementation is a minimal, non‑blocking version that only mimics the API.
- * It stores enqueued references in an internal list and ignores the concurrency,
- * waiting, and GC‑integration that the real Java version provides.
+ * It stores enqueued references in a locked list without the waiting or
+ * GC integration that the real Java version provides.
  */
 @Ported(from = "java.lang.ref.ReferenceQueue")
 open class ReferenceQueue<T> {
 
     // Internal queue for storing enqueued references.
+    private val lock = ReentrantLock()
     private val queue = mutableListOf<Reference<T>>()
 
     /**
@@ -22,7 +23,7 @@ open class ReferenceQueue<T> {
      * @return true if the reference was added; false otherwise.
      */
     open fun enqueue(ref: Reference<T>): Boolean {
-        queue.add(ref)
+        lock.withLock { queue.add(ref) }
         return true
     }
 
@@ -32,7 +33,7 @@ open class ReferenceQueue<T> {
      * Otherwise, returns null.
      */
     open fun poll(): Reference<T>? {
-        return if (queue.isNotEmpty()) queue.removeAt(0) else null
+        return lock.withLock { if (queue.isNotEmpty()) queue.removeAt(0) else null }
     }
 
     /**
@@ -64,7 +65,8 @@ open class ReferenceQueue<T> {
      * This is intended for diagnostic purposes.
      */
     open fun forEach(action: (Reference<T>) -> Unit) {
-        queue.forEach(action)
+        val snapshot = lock.withLock { queue.toList() }
+        snapshot.forEach(action)
     }
 
     companion object {

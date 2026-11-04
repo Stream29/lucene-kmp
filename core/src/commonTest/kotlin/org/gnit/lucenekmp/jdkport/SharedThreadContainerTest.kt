@@ -1,5 +1,8 @@
 package org.gnit.lucenekmp.jdkport
 
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlin.test.Test
@@ -86,5 +89,106 @@ class SharedThreadContainerTest {
         assertTrue(count >= 2)
 
         j1.cancel(); j2.cancel()
+    }
+
+    @Test
+    fun concurrentRegistryLifecycleAndStaleQueueCleanup() = runBlocking {
+        withTimeout(60_000) {
+            val parent = SharedThreadContainer.create("concurrent-parent")
+            try {
+                coroutineScope {
+                    repeat(8) { worker ->
+                        launch(Dispatchers.Default) {
+                            repeat(500) { iteration ->
+                                val container = SharedThreadContainer.create(parent, "$worker-$iteration")
+                                try {
+                                    assertTrue(ThreadContainers.children(parent).any { it === container })
+                                    ThreadContainers.children(ThreadContainers.root()).toList()
+                                } finally {
+                                    container.close()
+                                    container.close()
+                                }
+                            }
+                        }
+                    }
+                }
+                assertTrue(ThreadContainers.children(parent).none())
+                val key = ThreadContainers.registerContainer(parent) as WeakReference<*>
+                assertTrue(key.enqueue())
+                ThreadContainers.children(ThreadContainers.root()).toList()
+                assertNull(key.queue?.poll())
+            } finally {
+                parent.close()
+            }
+        }
+    }
+
+    @Test
+    fun concurrentQueueEnqueuePollAndSnapshotCallbacks() = runBlocking {
+        withTimeout(60_000) {
+            val queue = ReferenceQueue<Int>()
+            val consumed = mutableListOf<Int>()
+            val consumedLock = ReentrantLock()
+            coroutineScope {
+                repeat(8) { worker ->
+                    launch(Dispatchers.Default) {
+                        repeat(500) { iteration ->
+                            queue.enqueue(Reference(worker * 500 + iteration))
+                            queue.forEach { it.get() }
+                            queue.poll()?.get()?.let { value ->
+                                consumedLock.withLock { consumed.add(value) }
+                            }
+                        }
+                    }
+                }
+            }
+            while (true) {
+                val ref = queue.poll() ?: break
+                consumed.add(ref.get()!!)
+            }
+            assertEquals((0 until 4000).toSet(), consumed.toSet())
+            assertEquals(4000, consumed.size)
+            queue.enqueue(Reference(1))
+            queue.enqueue(Reference(2))
+            val snapshot = mutableListOf<Int?>()
+            queue.forEach { snapshot.add(it.get()); queue.poll() }
+            assertEquals(listOf<Int?>(1, 2), snapshot)
+            assertNull(queue.poll())
+        }
+    }
+
+    @Test
+    fun concurrentCloseIsIdempotent() = runBlocking {
+        val container = SharedThreadContainer.create("concurrent-close")
+        coroutineScope {
+            repeat(16) { launch(Dispatchers.Default) { repeat(100) { container.close() } } }
+        }
+        assertTrue(ThreadContainers.children(ThreadContainers.root()).none { it === container })
+    }
+
+    @Test
+    fun concurrentTrackingRootLifecycleAndSnapshots() = runBlocking {
+        withTimeout(60_000) {
+            val root = ThreadContainers.RootContainer.TrackingRootContainer()
+            val baseline = root.threadCount()
+            coroutineScope {
+                repeat(8) {
+                    launch(Dispatchers.Default) {
+                        repeat(500) {
+                            val job = kotlinx.coroutines.Job()
+                            try {
+                                root.onStart(job)
+                                assertTrue(root.threads().any { it === job })
+                                root.threadCount()
+                            } finally {
+                                root.onExit(job)
+                                job.cancel()
+                            }
+                        }
+                    }
+                }
+            }
+            assertEquals(baseline, root.threadCount())
+        }
     }
 }

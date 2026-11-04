@@ -19,6 +19,7 @@ object ThreadContainers {
     private val ROOT_CONTAINER: RootContainer
 
     // the set of thread containers registered with this class
+    private val registryLock = ReentrantLock()
     private val CONTAINER_REGISTRY: MutableSet<WeakReference<ThreadContainer>> = mutableSetOf()
     private val QUEUE: ReferenceQueue<ThreadContainer> = ReferenceQueue()
 
@@ -36,7 +37,7 @@ object ThreadContainers {
     /**
      * Expunge stale entries from the container registry.
      */
-    private fun expungeStaleEntries() {
+    private fun expungeStaleEntries() = registryLock.withLock {
         var key: Any?
         while ((QUEUE.poll().also { key = it }) != null) {
             CONTAINER_REGISTRY.remove(key)
@@ -54,20 +55,21 @@ object ThreadContainers {
      * Registers a thread container to be tracked this class, returning a key
      * that is used to remove it from the registry.
      */
-    fun registerContainer(container: ThreadContainer?): Any {
+    fun registerContainer(container: ThreadContainer?): Any = registryLock.withLock {
         expungeStaleEntries()
         val ref: WeakReference<ThreadContainer> = WeakReference(container, QUEUE as ReferenceQueue<ThreadContainer?>?)
         CONTAINER_REGISTRY.add(ref)
-        return ref
+        ref
     }
 
     /**
      * Removes a thread container from being tracked by specifying the key
      * returned when the thread container was registered.
      */
-    fun deregisterContainer(key: Any) {
+    fun deregisterContainer(key: Any) = registryLock.withLock {
         assert(key is WeakReference<*>)
         CONTAINER_REGISTRY.remove(key)
+        Unit
     }
 
     /**
@@ -102,9 +104,11 @@ object ThreadContainers {
      */
     fun children(container: ThreadContainer): Sequence<ThreadContainer> {
         // children of registered containers
-        val s1: Sequence<ThreadContainer> = CONTAINER_REGISTRY
-            .asSequence()
-            .mapNotNull { it.get() }
+        val snapshot = registryLock.withLock {
+            expungeStaleEntries()
+            CONTAINER_REGISTRY.mapNotNull { it.get() }
+        }
+        val s1: Sequence<ThreadContainer> = snapshot.asSequence()
             .filter { it.parent() === container }
 
         // container may enclose another container
@@ -206,23 +210,25 @@ object ThreadContainers {
         class TrackingRootContainer : RootContainer() {
             override fun onStart(thread: Job) {
                 /*assert(thread.isVirtual())*/
-                VTHREADS.add(thread)
+                virtualThreadsLock.withLock { VTHREADS.add(thread) }
             }
 
             override fun onExit(thread: Job) {
                 /*assert(thread.isVirtual())*/
-                VTHREADS.remove(thread)
+                virtualThreadsLock.withLock { VTHREADS.remove(thread) }
             }
 
             override fun threadCount(): Long {
-                return (platformThreads().count() + VTHREADS.size).toLong()
+                return (platformThreads().count() + virtualThreadsLock.withLock { VTHREADS.size }).toLong()
             }
 
             override fun threads(): Sequence<Job> {
-                return platformThreads() + VTHREADS.asSequence().filter { it.isActive }
+                val snapshot = virtualThreadsLock.withLock { VTHREADS.toList() }
+                return platformThreads() + snapshot.asSequence().filter { it.isActive }
             }
 
             companion object {
+                private val virtualThreadsLock = ReentrantLock()
                 private val VTHREADS: MutableSet<Job> = mutableSetOf()
             }
         }

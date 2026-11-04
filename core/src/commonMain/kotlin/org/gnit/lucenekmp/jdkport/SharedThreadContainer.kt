@@ -19,6 +19,8 @@ class SharedThreadContainer
     // explicit parent for shared containers
     @Volatile
     private var parentRef: ThreadContainer? = null
+    private val lock = ReentrantLock()
+
     // the virtual threads in the container, created lazily
     @Volatile
     private var virtualThreads: MutableSet<Job>? = null
@@ -44,31 +46,22 @@ class SharedThreadContainer
     override fun onStart(thread: Job) {
         // virtual threads needs to be tracked
         if (thread.isVirtual()) {
-            var vthreads = virtualThreads
-            if (vthreads == null) {
-        // lazily initialize the set
-        vthreads = mutableSetOf()
-        // publish to field (no CAS in this port)
-        this.virtualThreads = vthreads
+            lock.withLock {
+                val vthreads = virtualThreads ?: mutableSetOf<Job>().also { virtualThreads = it }
+                vthreads.add(thread)
             }
-            vthreads.add(thread)
         }
     }
 
     override fun onExit(thread: Job) {
-    if (thread.isVirtual()) virtualThreads?.remove(thread)
+        if (thread.isVirtual()) lock.withLock { virtualThreads?.remove(thread) }
     }
 
     override fun threads(): Sequence<Job> {
-        val platformThreads: Sequence<Job> =
-            JLA.allThreads.asSequence()
-                .filter { t: Job -> JLA.threadContainer(t) === this }
-        val vthreads: MutableSet<Job>? = this.virtualThreads
-        return if (vthreads == null) {
-            platformThreads
-        } else {
-            platformThreads + vthreads.asSequence().filter { it.isActive }
-        }
+        val platformThreads = JLA.allThreads.asSequence()
+            .filter { t: Job -> JLA.threadContainer(t) === this }
+        val snapshot = lock.withLock { virtualThreads?.toList().orEmpty() }
+        return platformThreads + snapshot.asSequence().filter { it.isActive }
     }
 
     /**
@@ -86,10 +79,12 @@ class SharedThreadContainer
      * still running or starting around the time that this method is invoked.
      */
     override fun close() {
-        if (!closed /*&& CLOSED.compareAndSet(this, false, true)*/) {
+        val registryKey = lock.withLock {
+            if (closed) return
             closed = true
-            ThreadContainers.deregisterContainer(key!!)
+            key!!
         }
+        ThreadContainers.deregisterContainer(registryKey)
     }
 
     companion object {
